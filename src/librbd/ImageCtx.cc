@@ -52,7 +52,7 @@ namespace {
 class ThreadPoolSingleton : public ThreadPool {
 public:
   explicit ThreadPoolSingleton(CephContext *cct)
-    : ThreadPool(cct, "librbd::thread_pool", "tp_librbd", 1,
+    : ThreadPool(cct, "librbd::thread_pool", "tp_librbd", 16,
                  "rbd_op_threads") {
     start();
   }

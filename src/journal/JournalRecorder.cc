@@ -60,7 +60,9 @@ JournalRecorder::JournalRecorder(librados::IoCtx &ioctx,
   uint8_t splay_width = m_journal_metadata->get_splay_width();
   for (uint8_t splay_offset = 0; splay_offset < splay_width; ++splay_offset) {
     uint64_t object_number = splay_offset + (m_current_set * splay_width);
-    m_object_ptrs[splay_offset] = create_object_recorder(object_number);
+
+    Mutex::Locker l(m_object_ptrs[splay_offset].m_lock);
+    create_object_recorder(m_object_ptrs[splay_offset], object_number);
   }
 
   m_journal_metadata->add_listener(&m_listener);
@@ -77,18 +79,24 @@ JournalRecorder::~JournalRecorder() {
 Future JournalRecorder::append(uint64_t tag_tid,
                                const bufferlist &payload_bl) {
 
-  Mutex::Locker locker(m_lock);
 
+  m_lock.Lock();
   uint64_t entry_tid = m_journal_metadata->allocate_entry_tid(tag_tid);
   uint8_t splay_width = m_journal_metadata->get_splay_width();
   uint8_t splay_offset = entry_tid % splay_width;
 
-  ObjectRecorderPtr object_ptr = get_object(splay_offset);
+  ObjectRecorderHolder& object_holder = get_object(splay_offset);
   uint64_t commit_tid = m_journal_metadata->allocate_commit_tid(
-    object_ptr->get_object_number(), tag_tid, entry_tid);
+    object_holder.object_ptr->get_object_number(), tag_tid, entry_tid);
   FutureImplPtr future(new FutureImpl(tag_tid, entry_tid, commit_tid));
   future->init(m_prev_future);
   m_prev_future = future;
+
+  object_holder.m_lock.Lock();
+  m_lock.Unlock();
+
+  //ldout(m_cct, 2) << "splay_offset=" << (int)splay_offset << " tag_tid=" << tag_tid << " entry_tid=" << entry_tid
+  //                << " commit_tid=" << commit_tid << dendl;
 
   bufferlist entry_bl;
   ::encode(Entry(future->get_tag_tid(), future->get_entry_tid(), payload_bl),
@@ -97,12 +105,18 @@ Future JournalRecorder::append(uint64_t tag_tid,
 
   AppendBuffers append_buffers;
   append_buffers.push_back(std::make_pair(future, entry_bl));
-  bool object_full = object_ptr->append(append_buffers);
+  bool object_full = object_holder.object_ptr->append(append_buffers);
+  uint64_t obj_num = object_holder.object_ptr->get_object_number();
+  const std::string& oid = object_holder.object_ptr->get_oid();
+
+  object_holder.m_lock.Unlock();
 
   if (object_full) {
-    ldout(m_cct, 10) << "object " << object_ptr->get_oid() << " now full"
-                     << dendl;
-    close_and_advance_object_set(object_ptr->get_object_number() / splay_width);
+    Mutex::Locker l2(m_lock);
+    ldout(m_cct, 10) << "object " << oid << " now full" << dendl;
+    //ldout(m_cct, 2) << "OBJECT_FULL [" << (int)splay_offset << ", " << tag_tid << ", " << entry_tid << ", "
+    //                << commit_tid << "] obj_num=" << obj_num << dendl;
+    close_and_advance_object_set(obj_num / splay_width);
   }
   return Future(future);
 }
@@ -110,25 +124,26 @@ Future JournalRecorder::append(uint64_t tag_tid,
 void JournalRecorder::flush(Context *on_safe) {
   C_Flush *ctx;
   {
-    Mutex::Locker locker(m_lock);
-
     ctx = new C_Flush(m_journal_metadata, on_safe, m_object_ptrs.size() + 1);
+
+    lock_object_ptrs();
     for (ObjectRecorderPtrs::iterator it = m_object_ptrs.begin();
          it != m_object_ptrs.end(); ++it) {
-      it->second->flush(ctx);
+      it->second.object_ptr->flush(ctx);
     }
+    unlock_object_ptrs();
   }
 
   // avoid holding the lock in case there is nothing to flush
   ctx->complete(0);
 }
 
-ObjectRecorderPtr JournalRecorder::get_object(uint8_t splay_offset) {
+JournalRecorder::ObjectRecorderHolder& JournalRecorder::get_object(uint8_t splay_offset) {
   assert(m_lock.is_locked());
 
-  ObjectRecorderPtr object_recoder = m_object_ptrs[splay_offset];
-  assert(object_recoder != NULL);
-  return object_recoder;
+  ObjectRecorderHolder& object_holder = m_object_ptrs[splay_offset];
+  assert(object_holder.object_ptr != NULL);
+  return object_holder;
 }
 
 void JournalRecorder::close_and_advance_object_set(uint64_t object_set) {
@@ -191,67 +206,77 @@ void JournalRecorder::open_object_set() {
                    << dendl;
 
   uint8_t splay_width = m_journal_metadata->get_splay_width();
+
+  lock_object_ptrs();
   for (ObjectRecorderPtrs::iterator it = m_object_ptrs.begin();
        it != m_object_ptrs.end(); ++it) {
-    ObjectRecorderPtr object_recorder = it->second;
-    if (object_recorder->get_object_number() / splay_width != m_current_set) {
-      assert(object_recorder->is_closed());
+    ObjectRecorderHolder& object_holder = it->second;
+    if (object_holder.object_ptr->get_object_number() / splay_width != m_current_set) {
+      assert(object_holder.object_ptr->is_closed());
 
       // ready to close object and open object in active set
-      create_next_object_recorder(object_recorder);
+      create_next_object_recorder(object_holder.object_ptr);
     }
   }
+  unlock_object_ptrs();
 }
 
 bool JournalRecorder::close_object_set(uint64_t active_set) {
   assert(m_lock.is_locked());
+
+  lock_object_ptrs();
 
   // object recorders will invoke overflow handler as they complete
   // closing the object to ensure correct order of future appends
   uint8_t splay_width = m_journal_metadata->get_splay_width();
   for (ObjectRecorderPtrs::iterator it = m_object_ptrs.begin();
        it != m_object_ptrs.end(); ++it) {
-    ObjectRecorderPtr object_recorder = it->second;
-    if (object_recorder->get_object_number() / splay_width != active_set) {
+    ObjectRecorderHolder& object_holder = it->second;
+
+    if (object_holder.object_ptr->get_object_number() / splay_width != active_set) {
       ldout(m_cct, 10) << __func__ << ": closing object "
-                       << object_recorder->get_oid() << dendl;
+                       << object_holder.object_ptr->get_oid() << dendl;
       // flush out all queued appends and hold future appends
-      if (!object_recorder->close()) {
+      if (!object_holder.object_ptr->close()) {
         ++m_in_flight_object_closes;
       } else {
         ldout(m_cct, 20) << __func__ << ": object "
-                         << object_recorder->get_oid() << " closed" << dendl;
+                         << object_holder.object_ptr->get_oid() << " closed" << dendl;
       }
     }
   }
+
+  unlock_object_ptrs();
   return (m_in_flight_object_closes == 0);
 }
 
-ObjectRecorderPtr JournalRecorder::create_object_recorder(
-    uint64_t object_number) {
-  ObjectRecorderPtr object_recorder(new ObjectRecorder(
+void JournalRecorder::create_object_recorder(
+    ObjectRecorderHolder& object_holder, uint64_t object_number) {
+  object_holder.object_ptr = ObjectRecorderPtr(new ObjectRecorder(
     m_ioctx, utils::get_object_name(m_object_oid_prefix, object_number),
     object_number, m_journal_metadata->get_timer(),
     m_journal_metadata->get_timer_lock(), &m_object_handler,
     m_journal_metadata->get_order(), m_flush_interval, m_flush_bytes,
     m_flush_age));
-  return object_recorder;
 }
 
 void JournalRecorder::create_next_object_recorder(
     ObjectRecorderPtr object_recorder) {
-  assert(m_lock.is_locked());
 
   uint64_t object_number = object_recorder->get_object_number();
   uint8_t splay_width = m_journal_metadata->get_splay_width();
   uint8_t splay_offset = object_number % splay_width;
 
-  ObjectRecorderPtr new_object_recorder = create_object_recorder(
-     (m_current_set * splay_width) + splay_offset);
+  ObjectRecorderHolder& object_holder = m_object_ptrs[splay_offset];
+
+  assert(object_holder.m_lock.is_locked());
+  create_object_recorder(
+     object_holder, (m_current_set * splay_width) + splay_offset);
 
   ldout(m_cct, 10) << __func__ << ": "
                    << "old oid=" << object_recorder->get_oid() << ", "
-                   << "new oid=" << new_object_recorder->get_oid() << dendl;
+                   << "new oid=" << object_holder.object_ptr->get_oid()
+                   << dendl;
   AppendBuffers append_buffers;
   object_recorder->claim_append_buffers(&append_buffers);
 
@@ -259,12 +284,10 @@ void JournalRecorder::create_next_object_recorder(
   for (auto &append_buffer : append_buffers) {
     m_journal_metadata->overflow_commit_tid(
       append_buffer.first->get_commit_tid(),
-      new_object_recorder->get_object_number());
+      object_holder.object_ptr->get_object_number());
   }
 
-  new_object_recorder->append(append_buffers);
-
-  m_object_ptrs[splay_offset] = new_object_recorder;
+  object_holder.object_ptr->append(append_buffers);
 }
 
 void JournalRecorder::handle_update() {
@@ -297,15 +320,19 @@ void JournalRecorder::handle_closed(ObjectRecorder *object_recorder) {
   uint64_t object_number = object_recorder->get_object_number();
   uint8_t splay_width = m_journal_metadata->get_splay_width();
   uint8_t splay_offset = object_number % splay_width;
-  ObjectRecorderPtr active_object_recorder = m_object_ptrs[splay_offset];
-  assert(active_object_recorder->get_object_number() == object_number);
+  ObjectRecorderHolder& active_object_holder = m_object_ptrs[splay_offset];
+  {
+    Mutex::Locker holder_locker(active_object_holder.m_lock);
+    assert(active_object_holder.object_ptr->get_object_number() == object_number);
 
-  assert(m_in_flight_object_closes > 0);
-  --m_in_flight_object_closes;
+    assert(m_in_flight_object_closes > 0);
+    --m_in_flight_object_closes;
 
-  // object closed after advance active set committed
-  ldout(m_cct, 20) << __func__ << ": object "
-                   << active_object_recorder->get_oid() << " closed" << dendl;
+    // object closed after advance active set committed
+    ldout(m_cct, 20) << __func__ << ": object "
+                     << active_object_holder.object_ptr->get_oid() << " closed"
+                     << dendl;
+  }
   if (m_in_flight_object_closes == 0) {
     if (m_in_flight_advance_sets == 0) {
       // peer forced closing of object set
@@ -325,12 +352,12 @@ void JournalRecorder::handle_overflow(ObjectRecorder *object_recorder) {
   uint64_t object_number = object_recorder->get_object_number();
   uint8_t splay_width = m_journal_metadata->get_splay_width();
   uint8_t splay_offset = object_number % splay_width;
-  ObjectRecorderPtr active_object_recorder = m_object_ptrs[splay_offset];
-  assert(active_object_recorder->get_object_number() == object_number);
+  ObjectRecorderHolder& active_object_holder = m_object_ptrs[splay_offset];
+  assert(active_object_holder.object_ptr->get_object_number() == object_number);
 
   ldout(m_cct, 20) << __func__ << ": object "
-                   << active_object_recorder->get_oid() << " overflowed"
-                   << dendl;
+                   << active_object_holder.object_ptr->get_oid()
+                   << " overflowed" << dendl;
   close_and_advance_object_set(object_number / splay_width);
 }
 
