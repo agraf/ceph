@@ -13,7 +13,6 @@
 #include "journal/FutureImpl.h"
 #include "journal/JournalMetadata.h"
 #include "journal/ObjectRecorder.h"
-#include "journal/Utils.h"
 #include <map>
 #include <string>
 
@@ -23,16 +22,6 @@ namespace journal {
 
 class JournalRecorder {
 public:
-  struct ObjectRecorderHolder {
-    ObjectRecorderPtr object_ptr;
-    Mutex m_lock;
-
-    ObjectRecorderHolder() :
-      object_ptr(nullptr),
-      m_lock(utils::unique_lock_name("ObjectRecorderH::m_lock", this))
-    {}
-  };
-
   JournalRecorder(librados::IoCtx &ioctx, const std::string &object_oid_prefix,
                   const JournalMetadataPtr &journal_metadata,
                   uint32_t flush_interval, uint64_t flush_bytes,
@@ -42,10 +31,10 @@ public:
   Future append(uint64_t tag_tid, const bufferlist &bl);
   void flush(Context *on_safe);
 
-  ObjectRecorderHolder& get_object(uint8_t splay_offset);
+  ObjectRecorderPtr get_object(uint8_t splay_offset);
 
 private:
-  typedef std::map<uint8_t, ObjectRecorderHolder> ObjectRecorderPtrs;
+  typedef std::map<uint8_t, ObjectRecorderPtr> ObjectRecorderPtrs;
 
   struct Listener : public JournalMetadata::Listener {
     JournalRecorder *journal_recorder;
@@ -103,6 +92,7 @@ private:
   uint32_t m_in_flight_object_closes = 0;
   uint64_t m_current_set;
   ObjectRecorderPtrs m_object_ptrs;
+  std::vector<Mutex *> m_object_locks;
 
   FutureImplPtr m_prev_future;
 
@@ -114,8 +104,8 @@ private:
 
   void close_and_advance_object_set(uint64_t object_set);
 
-  void create_object_recorder(ObjectRecorderHolder& object_holder,
-                              uint64_t object_number);
+  ObjectRecorderPtr create_object_recorder(uint64_t object_number,
+                                           Mutex *lock);
   void create_next_object_recorder(ObjectRecorderPtr object_recorder);
 
   void handle_update();
@@ -124,14 +114,14 @@ private:
   void handle_overflow(ObjectRecorder *object_recorder);
 
   void lock_object_ptrs() {
-    for (auto& ptr : m_object_ptrs) {
-      ptr.second.m_lock.Lock();
+    for (auto& lock : m_object_locks) {
+      lock->Lock();
     }
   }
 
   void unlock_object_ptrs() {
-    for (auto& ptr : m_object_ptrs) {
-      ptr.second.m_lock.Unlock();
+    for (auto& lock : m_object_locks) {
+      lock->Unlock();
     }
   }
 };

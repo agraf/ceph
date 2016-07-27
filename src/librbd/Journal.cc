@@ -860,21 +860,18 @@ uint64_t Journal<I>::append_io_events(journal::EventType event_type,
 
   Futures futures;
   uint64_t tid;
-  uint64_t tag_tid;
   {
     {
       Mutex::Locker locker(m_lock);
       assert(m_state == STATE_READY);
-      tag_tid = m_tag_tid;
 
-      Mutex::Locker event_locker(m_event_lock);
       tid = ++m_event_tid;
       assert(tid != 0);
     }
 
     for (auto &bl : bufferlists) {
       assert(bl.length() <= m_max_append_size);
-      futures.push_back(m_journaler->append(tag_tid, bl));
+      futures.push_back(m_journaler->append(m_tag_tid, bl));
     }
     Mutex::Locker event_locker(m_event_lock);
     m_events[tid] = Event(futures, requests, offset, length);
