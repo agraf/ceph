@@ -7,7 +7,6 @@
 #include "librbd/ImageCtx.h"
 #include "librbd/ImageState.h"
 #include "librbd/internal.h"
-#include "librbd/ObjectMap.h"
 #include "librbd/Operations.h"
 #include "librbd/TaskFinisher.h"
 #include "librbd/Utils.h"
@@ -15,13 +14,9 @@
 #include "librbd/image_watcher/Notifier.h"
 #include "librbd/image_watcher/NotifyLockOwner.h"
 #include "include/encoding.h"
-#include "include/stringify.h"
 #include "common/errno.h"
 #include "common/WorkQueue.h"
-#include <sstream>
 #include <boost/bind.hpp>
-#include <boost/function.hpp>
-#include <boost/scope_exit.hpp>
 
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
@@ -558,6 +553,10 @@ bool ImageWatcher::handle_payload(const HeaderUpdatePayload &payload,
 
   m_image_ctx.state->handle_update_notification();
   m_image_ctx.perfcounter->inc(l_librbd_notify);
+  if (ack_ctx != nullptr) {
+    m_image_ctx.state->flush_update_watchers(new C_ResponseMessage(ack_ctx));
+    return false;
+  }
   return true;
 }
 
@@ -737,7 +736,7 @@ bool ImageWatcher::handle_payload(const SnapCreatePayload &payload,
       ldout(m_image_ctx.cct, 10) << this << " remote snap_create request: "
 			         << payload.snap_name << dendl;
 
-      m_image_ctx.operations->execute_snap_create(payload.snap_name.c_str(),
+      m_image_ctx.operations->execute_snap_create(payload.snap_name,
                                                   new C_ResponseMessage(ack_ctx),
                                                   0, false);
       return false;
@@ -759,7 +758,7 @@ bool ImageWatcher::handle_payload(const SnapRenamePayload &payload,
 			         << payload.snap_name << dendl;
 
       m_image_ctx.operations->execute_snap_rename(payload.snap_id,
-                                                  payload.snap_name.c_str(),
+                                                  payload.snap_name,
                                                   new C_ResponseMessage(ack_ctx));
       return false;
     } else if (r < 0) {
@@ -778,7 +777,7 @@ bool ImageWatcher::handle_payload(const SnapRemovePayload &payload,
       ldout(m_image_ctx.cct, 10) << this << " remote snap_remove request: "
 			         << payload.snap_name << dendl;
 
-      m_image_ctx.operations->execute_snap_remove(payload.snap_name.c_str(),
+      m_image_ctx.operations->execute_snap_remove(payload.snap_name,
                                                   new C_ResponseMessage(ack_ctx));
       return false;
     } else if (r < 0) {
@@ -797,7 +796,7 @@ bool ImageWatcher::handle_payload(const SnapProtectPayload& payload,
       ldout(m_image_ctx.cct, 10) << this << " remote snap_protect request: "
                                  << payload.snap_name << dendl;
 
-      m_image_ctx.operations->execute_snap_protect(payload.snap_name.c_str(),
+      m_image_ctx.operations->execute_snap_protect(payload.snap_name,
                                                    new C_ResponseMessage(ack_ctx));
       return false;
     } else if (r < 0) {
@@ -816,7 +815,7 @@ bool ImageWatcher::handle_payload(const SnapUnprotectPayload& payload,
       ldout(m_image_ctx.cct, 10) << this << " remote snap_unprotect request: "
                                  << payload.snap_name << dendl;
 
-      m_image_ctx.operations->execute_snap_unprotect(payload.snap_name.c_str(),
+      m_image_ctx.operations->execute_snap_unprotect(payload.snap_name,
                                                      new C_ResponseMessage(ack_ctx));
       return false;
     } else if (r < 0) {
@@ -861,7 +860,7 @@ bool ImageWatcher::handle_payload(const RenamePayload& payload,
       ldout(m_image_ctx.cct, 10) << this << " remote rename request: "
                                  << payload.image_name << dendl;
 
-      m_image_ctx.operations->execute_rename(payload.image_name.c_str(),
+      m_image_ctx.operations->execute_rename(payload.image_name,
                                              new C_ResponseMessage(ack_ctx));
       return false;
     } else if (r < 0) {
