@@ -9,6 +9,7 @@
 #include "include/Context.h"
 #include "include/interval_set.h"
 #include "common/Mutex.h"
+#include "common/Cond.h"
 #include "journal/Future.h"
 #include "journal/JournalMetadataListener.h"
 #include "journal/ReplayEntry.h"
@@ -289,6 +290,7 @@ private:
   Mutex m_event_lock;
   uint64_t m_event_tid;
   Events m_events;
+  Cond m_events_cond;
 
   atomic_t m_op_tid;
   TidToFutures m_op_futures;

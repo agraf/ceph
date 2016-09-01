@@ -12,6 +12,13 @@ set(librbd_test
 add_library(rbd_test STATIC ${librbd_test})
 set_target_properties(rbd_test PROPERTIES COMPILE_FLAGS ${UNITTEST_CXX_FLAGS})
 
+set(librbd_test_mock_srcs
+  mock/MockImageCtx.cc
+  mock/MockJournal.cc)
+add_library(rbd_test_mock STATIC ${librbd_test_mock_srcs})
+set_target_properties(rbd_test_mock PROPERTIES COMPILE_FLAGS
+  ${UNITTEST_CXX_FLAGS})
+
 # unittest_librbd
 # doesn't use add_ceph_test because it is called by run-rbd-unit-tests.sh
 set(unittest_librbd_srcs

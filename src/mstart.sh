@@ -14,6 +14,7 @@ instance=$1
 shift
 
 vstart_path=`dirname $0`
+echo "VSTART_PATH: $vstart_path PWD=`pwd`"
 
 root_path=`dirname $0`
 root_path=`(cd $root_path; pwd)`
