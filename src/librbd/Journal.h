@@ -319,7 +319,7 @@ private:
   ListenerMap m_listener_map;
 
   uint64_t append_io_events(journal::EventType event_type,
-                            const Bufferlists &bufferlists,
+                            Bufferlists *bufferlists,
                             const AioObjectRequests &requests,
                             uint64_t offset, size_t length, bool flush_entry);
   Future wait_event(Mutex &lock, uint64_t tid, Context *on_safe);

@@ -147,7 +147,7 @@ struct C_DecodeTags : public Context {
 class ThreadPoolSingleton : public ThreadPool {
 public:
   explicit ThreadPoolSingleton(CephContext *cct)
-    : ThreadPool(cct, "librbd::Journal", "tp_librbd_journ", 16) {
+    : ThreadPool(cct, "librbd::Journal", "tp_librbd_journ", 1) {
     start();
   }
   virtual ~ThreadPoolSingleton() {
@@ -870,7 +870,7 @@ uint64_t Journal<I>::append_write_event(uint64_t offset, size_t length,
     bytes_remaining -= event_length;
   } while (bytes_remaining > 0);
 
-  return append_io_events(journal::EVENT_TYPE_AIO_WRITE, *bufferlists, requests,
+  return append_io_events(journal::EVENT_TYPE_AIO_WRITE, bufferlists, requests,
                           offset, length, flush_entry);
 }
 
@@ -885,18 +885,18 @@ uint64_t Journal<I>::append_io_event(journal::EventEntry &&event_entry,
   bufferlist bl;
   ::encode(event_entry, bl);
   bufferlists->push_back(bl);
-  return append_io_events(event_entry.get_event_type(), *bufferlists, requests, offset,
+  return append_io_events(event_entry.get_event_type(), bufferlists, requests, offset,
                           length, flush_entry);
 }
 
 template <typename I>
 uint64_t Journal<I>::append_io_events(journal::EventType event_type,
-                                      const Bufferlists &bufferlists,
+                                      Bufferlists *bufferlists,
                                       const AioObjectRequests &requests,
                                       uint64_t offset, size_t length,
                                       bool flush_entry) {
   assert(m_image_ctx.owner_lock.is_locked());
-  assert(!bufferlists.empty());
+  assert(!bufferlists->empty());
 
   uint64_t tid;
   {
@@ -906,21 +906,18 @@ uint64_t Journal<I>::append_io_events(journal::EventType event_type,
     tid = ++m_event_tid;
     assert(tid != 0);
 
-    Bufferlists *newb = (Bufferlists *)&bufferlists;
     FunctionContext *ctx = new FunctionContext(
-        [newb, this, requests, offset, length, tid, event_type, flush_entry](int r) {
-          //std::cout << "Execute append_io_event: tid=" << tid << std::endl;
+        [this, bufferlists, requests, offset, length, tid, event_type,
+         flush_entry](int r) {
           Futures futures;
-          for (auto &bl : *newb) {
+          for (auto &bl : *bufferlists) {
             assert(bl.length() <= m_max_append_size);
             futures.push_back(m_journaler->append(m_tag_tid, bl));
           }
-          delete newb;
+          delete bufferlists;
           Mutex::Locker event_locker(m_event_lock);
           m_events[tid] = Event(futures, requests, offset, length);
           m_events_cond.Signal();
-
-//          std::cout << "append_io_event: m_events_cond.signal tid=" << tid << std::endl;
 
           CephContext *cct = m_image_ctx.cct;
           ldout(cct, 20) << this << " " << __func__ << ": "
@@ -1109,7 +1106,6 @@ typename Journal<I>::Future Journal<I>::wait_event(Mutex &lock, uint64_t tid,
 
   typename Events::iterator it = m_events.find(tid);
   while(it == m_events.end()) {
-    //std::cout << "flush_event: wait for tid=" << tid << std::endl;
     m_events_cond.Wait(m_event_lock);
     it = m_events.find(tid);
   }

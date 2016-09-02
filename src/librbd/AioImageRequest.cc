@@ -12,7 +12,7 @@
 #include "include/rados/librados.hpp"
 #include "common/WorkQueue.h"
 #include "osdc/Striper.h"
-#include <chrono>
+#include "trace.h"
 
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
@@ -298,6 +298,8 @@ void AbstractAioImageWrite<I>::send_request() {
   I &image_ctx = this->m_image_ctx;
   CephContext *cct = image_ctx.cct;
 
+  rdias::Trace::trace(0);
+
   RWLock::RLocker md_locker(image_ctx.md_lock);
 
   bool journaling = false;
@@ -336,9 +338,6 @@ void AbstractAioImageWrite<I>::send_request() {
 
   prune_object_extents(object_extents);
 
-  typedef std::chrono::high_resolution_clock _clock;
-  typedef std::chrono::time_point<_clock> _time;
-
   if (!object_extents.empty()) {
     uint64_t journal_tid = 0;
     aio_comp->set_request_count(
@@ -351,21 +350,15 @@ void AbstractAioImageWrite<I>::send_request() {
     if (journaling) {
       // in-flight ops are flushed prior to closing the journal
       assert(image_ctx.journal != NULL);
-      //_time begin_time = _clock::now();
+      rdias::Trace::trace(1);
       journal_tid = append_journal_event(requests, m_synchronous);
-      //_time end_time = _clock::now();
-      //uint64_t dur = std::chrono::duration_cast<std::chrono::microseconds>(
-      //                                        end_time - begin_time).count();
-      //std::cerr << "Journal Append: " << dur << " us" << std::endl;
+      rdias::Trace::trace(2);
     }
 
     if (image_ctx.object_cacher != NULL) {
-     // _time begin_time = _clock::now();
+      rdias::Trace::trace(3);
       send_cache_requests(object_extents, journal_tid);
-     // _time end_time = _clock::now();
-     // uint64_t dur = std::chrono::duration_cast<std::chrono::microseconds>(
-     //                                         end_time - begin_time).count();
-     // std::cerr << "Send to Cache : " << dur << " us" << std::endl;
+      rdias::Trace::trace(4);
     }
   } else {
     // no IO to perform -- fire completion
@@ -391,7 +384,6 @@ void AbstractAioImageWrite<I>::send_object_requests(
     C_AioRequest *req_comp = new C_AioRequest(aio_comp);
     AioObjectRequestHandle *request = create_object_request(*p, snapc,
                                                             req_comp);
-    std::cerr << "----> " << (void *)aio_object_requests << (void *)request << std::endl;
 
     // if journaling, stash the request for later; otherwise send
     if (request != NULL) {
